@@ -1,0 +1,177 @@
+ns sys {
+	fn brk(brk []) []
+	fn munmap(addr [], len U64)
+	fn write(fd U32, str [I8], count U64)
+	fn abort()
+}
+
+ns util {
+	fn strlen(str [I8]) U64 {
+		var n U64
+		for ; [str]; str++ {
+			n++
+		}
+		return n
+	}
+
+	fn memcpy(dst, src [], len U64) {
+		var ds, ss [I8]
+		ds = dst
+		ss = src
+		for var i U64; i < len; i++ {
+			[ds + i] = [ss + i]
+		}
+	}
+
+	fn panic(msg [I8]) {
+		sys.write(2, msg, strlen(msg))
+		sys.write(2, "\n", 1)
+		sys.abort()
+	}
+
+	fn println(msg [I8]) {
+		sys.write(1, msg, strlen(msg))
+		sys.write(1, "\n", 1)
+	}
+
+	fn printp(msg [I8], p []) {
+		sys.write(1, msg, strlen(msg))
+		sys.write(1, "\t0x", 3)
+		var n, i U64
+		var b I8
+		n = cast(p, U64)
+		for i = 64; i; {
+			i -= 4
+			b = cast(n>>i & 0xf, I8)
+			if b < 10 {
+				b += '0'
+			} else {
+				b += 'a' - 10
+			}
+			sys.write(1, &b, 1)
+		}
+		sys.write(1, "\n", 1)
+	}
+}
+
+ns gc {
+	type Object struct {
+		next [Object]
+		kind, count U32
+		items [[Object] 14]
+	}
+
+	type Heap struct {
+		alloc, end [Object]
+		first, free [Object]
+	}
+	var heap Heap
+
+	fn grow() {
+		heap.end += 0x4000
+		_ = sys.brk(heap.end)
+	}
+
+	fn mark(p []) {
+		if !p {
+			return
+		}
+
+		var obj [Object]
+		obj = p - 8
+
+		// Function and data have non-pointer first values
+		var i U32
+		var kind U32
+		kind = obj.kind
+		if kind <= 1 {
+			i = 1
+		}
+
+		// If marked, exit early
+		if kind & 0x8000_0000 {
+			return
+		}
+
+		// Mark this object
+		obj.kind |= 0x8000_0000
+
+		// Mark all referenced objects
+		for ; i < obj.count; i++ {
+			mark([obj.items + i])
+		}
+
+		if kind == 4 || kind == 5 { // Global or global ind
+			obj.kind = kind // Unmark since we don't traverse globals at the end
+		}
+	}
+
+	pub fn gc_(sp [[]]) {
+		// Mark
+		var bp [[]]
+		for [sp] {
+			bp = [sp]
+			sp += 2 // skip base and return pointer
+			for ; sp < bp; sp++ {
+				mark([sp])
+			}
+		}
+
+		// Sweep
+		var obj [[Object]]
+		var next [Object]
+		obj = &heap.first
+		var freed, kept U64
+		for [obj] {
+			if obj.kind & 0x8000_0000 {
+				obj.kind &= ^0x8000_0000
+				obj = &obj.next
+				kept++
+			} else {
+				next = obj.next
+				obj.next = heap.free
+				heap.free = [obj]
+				[obj] = next
+				freed++
+			}
+		}
+	}
+
+	pub fn alloc_(kind, count U32, sp [[]]) [] {
+		if !heap.end {
+			var brk []
+			brk = sys.brk(0)
+			heap.end = brk + 0x4000
+			heap.alloc = brk
+			_ = sys.brk(heap.end)
+			heap.first = 0
+			heap.free = 0
+		}
+
+		if count > 14 {
+			util.panic("Objects of size >14 are not yet supported")
+		}
+
+		var obj [Object]
+		if heap.free {
+			obj = heap.free
+			heap.free = obj.next
+		} else {
+			if heap.alloc >= heap.end {
+				gc_(sp)
+				if heap.alloc >= heap.end {
+					grow()
+				}
+			}
+			obj = heap.alloc
+			heap.alloc++
+		}
+
+		obj.next = heap.first
+		heap.first = obj
+		obj.kind = kind
+		obj.count = count
+
+		return &obj.kind
+	}
+}
